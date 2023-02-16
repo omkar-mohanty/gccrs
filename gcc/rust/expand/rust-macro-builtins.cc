@@ -17,41 +17,25 @@
 // <http://www.gnu.org/licenses/>.
 
 #include "rust-macro-builtins.h"
+#include "rust-ast-fragment.h"
 #include "rust-ast.h"
-#include "rust-diagnostics.h"
-#include "rust-expr.h"
-#include "rust-session-manager.h"
-#include "rust-macro-invoc-lexer.h"
-#include "rust-lex.h"
-#include "rust-parse.h"
-#include "rust-early-name-resolver.h"
 #include "rust-attribute-visitor.h"
+#include "rust-diagnostics.h"
+#include "rust-early-name-resolver.h"
+#include "rust-expr.h"
+#include "rust-lex.h"
+#include "rust-macro-invoc-lexer.h"
+#include "rust-macro.h"
+#include "rust-parse.h"
+#include "rust-session-manager.h"
+#include "rust-token.h"
+#include <memory>
+#include <utility>
 
 namespace Rust {
 namespace {
-
-/**
- * Shorthand function for creating unique_ptr tokens
- */
-static std::unique_ptr<AST::Token>
-make_token (const TokenPtr tok)
-{
-  return std::unique_ptr<AST::Token> (new AST::Token (tok));
-}
-
-std::unique_ptr<AST::Expr>
-make_string (Location locus, std::string value)
-{
-  return std::unique_ptr<AST::Expr> (
-    new AST::LiteralExpr (value, AST::Literal::STRING,
-			  PrimitiveCoreType::CORETYPE_STR, {}, locus));
-}
-
-// TODO: Is this correct?
-static AST::Fragment
-make_eager_builtin_invocation (
-  AST::BuiltinMacro kind, Location locus, AST::DelimTokenTree arguments,
-  std::vector<std::unique_ptr<AST::MacroInvocation>> &&pending_invocations)
+std::string
+make_macro_path_str (AST::BuiltinMacro kind)
 {
   std::string path_str;
 
@@ -92,6 +76,48 @@ make_eager_builtin_invocation (
       path_str = "include";
       break;
     }
+
+  return path_str;
+}
+
+static std::vector<std::unique_ptr<AST::MacroInvocation>>
+check_for_eager_invocations (
+  std::vector<std::unique_ptr<AST::Expr>> &expressions)
+{
+  std::vector<std::unique_ptr<AST::MacroInvocation>> pending;
+
+  for (auto &expr : expressions)
+    if (expr->get_ast_kind () == AST::Kind::MACRO_INVOCATION)
+      pending.emplace_back (std::unique_ptr<AST::MacroInvocation> (
+	static_cast<AST::MacroInvocation *> (expr->clone_expr ().release ())));
+
+  return pending;
+}
+
+/**
+ * Shorthand function for creating unique_ptr tokens
+ */
+static std::unique_ptr<AST::Token>
+make_token (const TokenPtr tok)
+{
+  return std::unique_ptr<AST::Token> (new AST::Token (tok));
+}
+
+std::unique_ptr<AST::Expr>
+make_string (Location locus, std::string value)
+{
+  return std::unique_ptr<AST::Expr> (
+    new AST::LiteralExpr (value, AST::Literal::STRING,
+			  PrimitiveCoreType::CORETYPE_STR, {}, locus));
+}
+
+// TODO: Is this correct?
+static AST::Fragment
+make_eager_builtin_invocation (
+  AST::BuiltinMacro kind, Location locus, AST::DelimTokenTree arguments,
+  std::vector<std::unique_ptr<AST::MacroInvocation>> &&pending_invocations)
+{
+  auto path_str = make_macro_path_str (kind);
 
   std::unique_ptr<AST::Expr> node = AST::MacroInvocation::Builtin (
     kind,
@@ -195,8 +221,9 @@ try_expand_many_expr (Parser<MacroInvocLexer> &parser,
    and return the LiteralExpr for it. Allow for an optional trailing comma,
    but otherwise enforce that these are the only tokens.  */
 
-std::unique_ptr<AST::LiteralExpr>
-parse_single_string_literal (AST::DelimTokenTree &invoc_token_tree,
+std::unique_ptr<AST::Expr>
+parse_single_string_literal (AST::BuiltinMacro kind,
+			     AST::DelimTokenTree &invoc_token_tree,
 			     Location invoc_locus, MacroExpander *expander)
 {
   MacroInvocLexer lex (invoc_token_tree.to_token_stream ());
@@ -219,11 +246,35 @@ parse_single_string_literal (AST::DelimTokenTree &invoc_token_tree,
   else if (parser.peek_current_token ()->get_id () == last_token_id)
     rust_error_at (invoc_locus, "macro takes 1 argument");
   else
-    rust_error_at (invoc_locus, "argument must be a string literal");
+    {
+      bool has_error = false;
+
+      auto expanded_expr
+	= try_expand_many_expr (parser, last_token_id, expander, has_error);
+
+      auto pending_invocations = check_for_eager_invocations (expanded_expr);
+
+      if (!pending_invocations.empty ())
+	{
+	  auto path_str = make_macro_path_str (kind);
+
+	  return AST::MacroInvocation::Builtin (
+	    kind,
+	    AST::MacroInvocData (AST::SimplePath ({AST::SimplePathSegment (
+				   path_str, invoc_locus)}),
+				 std::move (invoc_token_tree)),
+	    {}, invoc_locus, std::move (pending_invocations));
+	}
+      else
+	{
+	  rust_error_at (invoc_locus, "argument must be a string literal or a "
+				      "macro which expands to a string");
+	}
+    }
 
   parser.skip_token (last_token_id);
 
-  return lit_expr;
+  return std::unique_ptr<AST::Expr> (std::move (lit_expr));
 }
 
 /* Treat PATH as a path relative to the source file currently being
@@ -278,9 +329,44 @@ load_file_bytes (const char *filename)
 } // namespace
 
 AST::Fragment
-MacroBuiltin::assert_handler (Location, AST::MacroInvocData &)
+MacroBuiltin::assert_handler (Location invoc_locus, AST::MacroInvocData &invoc)
 {
-  rust_debug ("assert!() called");
+  auto invoc_token_tree = invoc.get_delim_tok_tree ();
+  MacroInvocLexer lex (invoc_token_tree.to_token_stream ());
+  Parser<MacroInvocLexer> parser (lex);
+
+  auto last_token_id = macro_end_token (invoc_token_tree, parser);
+
+  bool has_error = false;
+
+  auto expander = invoc.get_expander ();
+
+  auto expanded_expr
+    = try_expand_many_expr (parser, last_token_id, expander, has_error);
+
+  auto pending_invocations = check_for_eager_invocations (expanded_expr);
+
+  if (!pending_invocations.empty ())
+    {
+      return make_eager_builtin_invocation (AST::BuiltinMacro::Assert,
+					    invoc_locus, invoc_token_tree,
+					    std::move (pending_invocations));
+    }
+
+  if (expanded_expr.size () > 2 || expanded_expr.size () < 1)
+    {
+      rust_error_at (invoc_locus, "macro takes 1 or 2 arguments");
+    }
+
+  auto string_literal
+    = static_cast<AST::LiteralExpr *> (expanded_expr[1].get ());
+
+  if (string_literal->get_lit_type () != AST::Literal::STRING)
+    {
+      rust_error_at (invoc_locus, "macro expects a string literal");
+    }
+
+  parser.skip_token (last_token_id);
 
   return AST::Fragment::create_error ();
 }
@@ -323,10 +409,18 @@ MacroBuiltin::include_bytes_handler (Location invoc_locus,
   /* Get target filename from the macro invocation, which is treated as a path
      relative to the include!-ing file (currently being compiled).  */
   auto lit_expr
-    = parse_single_string_literal (invoc.get_delim_tok_tree (), invoc_locus,
+    = parse_single_string_literal (AST::BuiltinMacro::IncludeBytes,
+				   invoc.get_delim_tok_tree (), invoc_locus,
 				   invoc.get_expander ());
   if (lit_expr == nullptr)
     return AST::Fragment::create_error ();
+
+  if (!lit_expr->is_literal ())
+    {
+      auto token_tree = invoc.get_delim_tok_tree ();
+      return AST::Fragment ({AST::SingleASTNode (std::move (lit_expr))},
+			    token_tree.to_token_stream ());
+    }
 
   std::string target_filename
     = source_relative_path (lit_expr->as_string (), invoc_locus);
@@ -379,10 +473,18 @@ MacroBuiltin::include_str_handler (Location invoc_locus,
   /* Get target filename from the macro invocation, which is treated as a path
      relative to the include!-ing file (currently being compiled).  */
   auto lit_expr
-    = parse_single_string_literal (invoc.get_delim_tok_tree (), invoc_locus,
+    = parse_single_string_literal (AST::BuiltinMacro::IncludeStr,
+				   invoc.get_delim_tok_tree (), invoc_locus,
 				   invoc.get_expander ());
   if (lit_expr == nullptr)
     return AST::Fragment::create_error ();
+
+  if (!lit_expr->is_literal ())
+    {
+      auto token_tree = invoc.get_delim_tok_tree ();
+      return AST::Fragment ({AST::SingleASTNode (std::move (lit_expr))},
+			    token_tree.to_token_stream ());
+    }
 
   std::string target_filename
     = source_relative_path (lit_expr->as_string (), invoc_locus);
@@ -453,29 +555,23 @@ MacroBuiltin::compile_error_handler (Location invoc_locus,
 				     AST::MacroInvocData &invoc)
 {
   auto lit_expr
-    = parse_single_string_literal (invoc.get_delim_tok_tree (), invoc_locus,
+    = parse_single_string_literal (AST::BuiltinMacro::CompileError,
+				   invoc.get_delim_tok_tree (), invoc_locus,
 				   invoc.get_expander ());
   if (lit_expr == nullptr)
     return AST::Fragment::create_error ();
+
+  if (!lit_expr->is_literal ())
+    {
+      auto token_tree = invoc.get_delim_tok_tree ();
+      return AST::Fragment ({AST::SingleASTNode (std::move (lit_expr))},
+			    token_tree.to_token_stream ());
+    }
 
   std::string error_string = lit_expr->as_string ();
   rust_error_at (invoc_locus, "%s", error_string.c_str ());
 
   return AST::Fragment::create_error ();
-}
-
-static std::vector<std::unique_ptr<AST::MacroInvocation>>
-check_for_eager_invocations (
-  std::vector<std::unique_ptr<AST::Expr>> &expressions)
-{
-  std::vector<std::unique_ptr<AST::MacroInvocation>> pending;
-
-  for (auto &expr : expressions)
-    if (expr->get_ast_kind () == AST::Kind::MACRO_INVOCATION)
-      pending.emplace_back (std::unique_ptr<AST::MacroInvocation> (
-	static_cast<AST::MacroInvocation *> (expr->clone_expr ().release ())));
-
-  return pending;
 }
 
 /* Expand builtin macro concat!(), which joins all the literal parameters
@@ -707,11 +803,18 @@ MacroBuiltin::include_handler (Location invoc_locus, AST::MacroInvocData &invoc)
   /* Get target filename from the macro invocation, which is treated as a path
      relative to the include!-ing file (currently being compiled).  */
   auto lit_expr
-    = parse_single_string_literal (invoc.get_delim_tok_tree (), invoc_locus,
+    = parse_single_string_literal (AST::BuiltinMacro::Include,
+				   invoc.get_delim_tok_tree (), invoc_locus,
 				   invoc.get_expander ());
   if (lit_expr == nullptr)
     return AST::Fragment::create_error ();
 
+  if (!lit_expr->is_literal ())
+    {
+      auto token_tree = invoc.get_delim_tok_tree ();
+      return AST::Fragment ({AST::SingleASTNode (std::move (lit_expr))},
+			    token_tree.to_token_stream ());
+    }
   std::string filename
     = source_relative_path (lit_expr->as_string (), invoc_locus);
   auto target_filename
